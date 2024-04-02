@@ -1,0 +1,251 @@
+import gatb
+import os
+import math
+from collections import defaultdict
+from gatb import Bank, BankFasta, Kmer, Graph, Node, Sequence, System, Iterator, PairedIterator, ProgressIterator, Dispatcher
+from math import ceil, log
+
+STR_BASE = "-base"
+STR_INPUT = "-input"
+STR_OUTPUT = "-output"
+STR_KMER = "-kmer"
+STR_PAIR1 = "-pair1"
+STR_PAIR2 = "-pair2"
+STR_SORTING = "-sorting"
+STR_KSORTING = "-ksorting"
+STR_BSIZE = "-binsize"
+COLL_STAT = "-cs"
+STR_TYPE = "-type"
+
+def get_length(bank):
+    it = bank.iterator()
+    max_length = 0
+    for seq in it:
+        max_length = seq.getDataSize()
+        break
+    return max_length
+
+def get_number(bank):
+    it = bank.iterator()
+    seq_num = 0
+    for seq in it:
+        seq_num += 1
+    return seq_num
+
+def get_nodes_number(graph_iterator):
+    count = 0
+    for node in graph_iterator:
+        count += 1
+    return count
+
+def get_median(graph, seq, kmer, nodeit):
+    read_abundance = 0
+    i = 0
+    length = seq.getDataSize()
+    abdce = [0] * (length - kmer + 1)
+    model = Kmer.ModelCanonical(kmer)
+    itKmer = model.iterator()
+    itKmer.setData(seq.getData())
+    
+    for kmer_value in itKmer:
+        s = model.toString(kmer_value.value)
+        node = graph.buildNode(s)
+        index = graph.nodeMPHFIndex(node)
+        abund = nodeit[index]
+        abdce[i] = abund
+        i += 1
+    
+    abdce.sort()
+    i_length = len(abdce)
+    if i_length % 2 == 0:
+        median = (abdce[i_length // 2] + abdce[i_length // 2 - 1]) / 2
+    else:
+        median = abdce[i_length // 2]
+    
+    return median
+
+def calculate_quality(qual):
+    return sum(map(ord, qual))
+
+def calculate_abundance(graph, seq, itKmer, model):
+    score = 0
+    for kmer_value in itKmer:
+        s = model.toString(kmer_value.value)
+        node = graph.buildNode(s)
+        index = graph.nodeMPHFIndex(node)
+        abund = int(graph.queryAbundance(node))
+    return score
+
+def read_acceptance(graph, itKmer, model, counter, base, nodeit):
+    acceptance = 0
+    for kmer_value in itKmer:
+        s = model.toString(kmer_value.value)
+        node = graph.buildNode(s)
+        index = graph.nodeMPHFIndex(node)
+        abund = nodeit[index]
+        
+        threshold = ceil((log(abund) / log(base)))
+        if threshold > abund:
+            threshold = abund
+        if threshold < 1:
+            threshold = 1
+        if counter[index] < threshold:
+            acceptance += 1
+            break
+    return acceptance
+
+def single_end(graph, filename, out_file, base, kmer, nb_cores, nodeit, type):
+    count = 0
+    dispatcher = Dispatcher(nb_cores)
+    sync = System.thread().newSynchronizer()
+    it = graph.iterator()
+    InputDataset = Bank.open(filename)
+    itSeq = ProgressIterator(InputDataset)
+    
+    if type.lower() in ["fastq", "fq"]:
+        extension = ".fq"
+    else:
+        extension = ".fa"
+    
+    out_file1 = out_file + extension
+    if type.lower() in ["fastq", "fq"]:
+        OutDataset = BankFasta(out_file1, True)
+    else:
+        OutDataset = BankFasta(out_file1)
+    
+    node_size = it.size()
+    counter = [0] * node_size
+
+    def iterate_function(seq):
+        nonlocal count
+        length = seq.getDataSize()
+        flag = 1
+        gb = 1
+        acceptance = 0
+        model = Kmer.ModelCanonical(kmer)
+        itKmer = model.iterator()
+        itKmer.setData(seq.getData())
+        
+        nonlocal counter
+        nonlocal graph
+        
+        if flag == 1:
+            acceptance = read_acceptance(graph, itKmer, model, counter, base, nodeit)
+        
+        if acceptance > 0:
+            for kmer_value in itKmer:
+                s = model.toString(kmer_value.value)
+                node = graph.buildNode(s)
+                
+                if graph.contains(node):
+                    index = graph.nodeMPHFIndex(node)
+                    abund = nodeit[index]
+                    
+                    if gb == 1:
+                        counter[index] += 1
+                        gb = 0
+                    
+                    for i in range(abund):
+                        OutDataset.insert(seq)
+                        count += 1
+                if count > 100000:
+                    count = 0
+                    OutDataset.flush()
+    
+    dispatcher.iterate(itSeq, iterate_function)
+    OutDataset.flush()
+    InputDataset.close()
+    OutDataset.close()
+
+def main():
+    base = 1.0
+    nb_cores = 1
+    type = "fa"
+    out_file = ""
+    filename = ""
+    pair1 = ""
+    pair2 = ""
+    kmer = 0
+    sorting = 1
+    bsize = 0
+    ksorting = 0
+    
+    InputDataset = Bank.open(filename)
+    itSeq = ProgressIterator(InputDataset)
+    max_length = get_length(InputDataset)
+    seq_num = get_number(InputDataset)
+    
+    if kmer == 0:
+        kmer = max_length
+        if kmer > 31:
+            kmer = 31
+    
+    model = Kmer.ModelCanonical(kmer)
+    itKmer = model.iterator()
+    
+    graph = Graph("graph", False, False, False, nb_cores)
+    nodeit = [0] * graph.nodeMPHFSize()
+    
+    def iterate_function(seq):
+        nonlocal graph
+        nonlocal itKmer
+        nonlocal model
+        nonlocal nodeit
+        
+        length = seq.getDataSize()
+        model = Kmer.ModelCanonical(kmer)
+        itKmer = model.iterator()
+        itKmer.setData(seq.getData())
+        
+        for kmer_value in itKmer:
+            s = model.toString(kmer_value.value)
+            node = graph.buildNode(s)
+            
+            if not graph.contains(node):
+                graph.addNode(node)
+                index = graph.nodeMPHFIndex(node)
+                nodeit[index] = 1
+            else:
+                index = graph.nodeMPHFIndex(node)
+                nodeit[index] += 1
+        
+        return True
+    
+    dispatcher = Dispatcher(nb_cores)
+    dispatcher.iterate(itSeq, iterate_function)
+    InputDataset.close()
+    
+    print("Nodes number:", get_nodes_number(graph.iterator()))
+    
+    itSeq = ProgressIterator(Bank.open(filename))
+    itKmer.setData(seq.getData())
+    
+    def iterate_function(seq):
+        nonlocal graph
+        nonlocal itKmer
+        nonlocal model
+        nonlocal nodeit
+        
+        length = seq.getDataSize()
+        model = Kmer.ModelCanonical(kmer)
+        itKmer = model.iterator()
+        itKmer.setData(seq.getData())
+        
+        for kmer_value in itKmer:
+            s = model.toString(kmer_value.value)
+            node = graph.buildNode(s)
+            index = graph.nodeMPHFIndex(node)
+            abund = nodeit[index]
+            
+            if abund > 1:
+                graph.addEdge(graph.nodeMPHFIndex(graph.buildNode(model.toString(kmer_value.value[1:]))), index)
+        
+        return True
+    
+    dispatcher.iterate(itSeq, iterate_function)
+    itSeq.close()
+    
+    single_end(graph, filename, out_file, base, kmer, nb_cores, nodeit, type)
+
+if __name__ == "__main__":
+    main()
